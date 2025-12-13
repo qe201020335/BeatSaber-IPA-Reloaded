@@ -53,53 +53,77 @@ namespace IPA.Loader
             AppDomain.CurrentDomain.AssemblyResolve += AssemblyLibLoader;
         }
 
+        private static readonly object lockObj = new();
+
+        [ThreadStatic]
+        private static bool thisThreadIsInitializing;
+
         internal static void SetupAssemblyFilenames(bool force = false)
         {
             if (FilenameLocations == null || force)
             {
-                FilenameLocations = new Dictionary<string, (string, Version)>();
-
-                var files = TraverseTree(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!)
-                    .Concat(TraverseTree(LibraryPath, s => s != NativeLibraryPath));
-
-                foreach (var fileInfo in files)
+                lock (lockObj)
                 {
-                    if (!fileInfo.Extension.Equals(".dll", StringComparison.OrdinalIgnoreCase))
+                    if (thisThreadIsInitializing)
                     {
-                        continue;
+                        Log(Logger.Level.Warning, $"Library loader initialization recurison detected");
+                        return;
+                    }
+                    if (FilenameLocations is not null && !force) return;
+
+                    thisThreadIsInitializing = true;
+
+                    var newFilenameLocations = new Dictionary<string, (string, Version Version)>();
+
+                    var files = TraverseTree(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!)
+                        .Concat(TraverseTree(LibraryPath, s => s != NativeLibraryPath));
+
+                    foreach (var fileInfo in files)
+                    {
+                        if (!fileInfo.Extension.Equals(".dll", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            var assemblyName = AssemblyName.GetAssemblyName(fileInfo.FullName);
+                            if (!newFilenameLocations.TryGetValue(fileInfo.Name, out var assemblyInfo) || assemblyName.Version > assemblyInfo.Version)
+                            {
+                                newFilenameLocations[fileInfo.Name] = (fileInfo.FullName, assemblyName.Version);
+                            }
+                            else
+                            {
+                                Log(Logger.Level.Notice, $"Multiple instances of {fileInfo.Name} exist! Ignoring {fileInfo.FullName}");
+                            }
+                        }
+                        catch (BadImageFormatException e)
+                        {
+                            Log(Logger.Level.Warning, $"Exception trying to get version information for {fileInfo.FullName}: {e}");
+                        }
                     }
 
-                    try
+                    static void AddDirectoryToPath(string path)
                     {
-                        var assemblyName = AssemblyName.GetAssemblyName(fileInfo.FullName);
-                        if (!FilenameLocations.TryGetValue(fileInfo.Name, out var assemblyInfo) || assemblyName.Version > assemblyInfo.Version)
-                        {
-                            FilenameLocations[fileInfo.Name] = (fileInfo.FullName, assemblyName.Version);
-                        }
-                        else
-                        {
-                            Log(Logger.Level.Notice, $"Multiple instances of {fileInfo.Name} exist! Ignoring {fileInfo.FullName}");
-                        }
+                        Environment.SetEnvironmentVariable("Path", path + Path.PathSeparator + Environment.GetEnvironmentVariable("Path"));
                     }
-                    catch (BadImageFormatException) { }
-                }
 
-                static void AddDirectoryToPath(string path)
-                {
-                    Environment.SetEnvironmentVariable("Path", path + Path.PathSeparator + Environment.GetEnvironmentVariable("Path"));
-                }
+                    if (Directory.Exists(NativeLibraryPath))
+                    {
+                        AddDirectoryToPath(NativeLibraryPath);
+                        _ = TraverseTree(NativeLibraryPath, dir =>
+                        { // this is a terrible hack for iterating directories
+                            AddDirectoryToPath(dir); return true;
+                        }).All(f => true); // force it to iterate all
+                    }
 
-                if (Directory.Exists(NativeLibraryPath))
-                {
-                    AddDirectoryToPath(NativeLibraryPath);
-                    _ = TraverseTree(NativeLibraryPath, dir =>
-                    { // this is a terrible hack for iterating directories
-                        AddDirectoryToPath(dir); return true;
-                    }).All(f => true); // force it to iterate all
-                }
+                    FilenameLocations = newFilenameLocations;
 
-                _ = LoadLibrary(new AssemblyName("Newtonsoft.Json, Version=12.0.0.0, Culture=neutral"));
-                _ = LoadLibrary(new AssemblyName("netstandard, Version=2.0.0.0, Culture=neutral"));
+                    _ = LoadLibrary(new AssemblyName("Newtonsoft.Json, Version=12.0.0.0, Culture=neutral"));
+                    _ = LoadLibrary(new AssemblyName("netstandard, Version=2.0.0.0, Culture=neutral"));
+
+                    thisThreadIsInitializing = false;
+                }
             }
         }
 
