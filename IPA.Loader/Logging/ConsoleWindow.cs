@@ -1,5 +1,6 @@
 ﻿using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -28,7 +29,7 @@ namespace IPA.Logging
             bool consoleAttached;
             if (alwaysCreateNewConsole || !(consoleAttached = AttachConsole(processId)))
             {
-                consoleAttached = AllocConsole();
+                consoleAttached = TryAttachToConsoleHost() || AllocConsole();
             }
 
             if (consoleAttached)
@@ -36,6 +37,78 @@ namespace IPA.Logging
                 InitializeStreams();
                 IsInitialized = true;
             }
+        }
+
+        /// <summary>
+        /// Creates the console through a console-subsystem helper process and attaches to it.
+        /// </summary>
+        /// <remarks>
+        /// conhost only hands a new console off to the default terminal (e.g. Windows Terminal) for console
+        /// applications, so <see cref="AllocConsole"/> from the game always opens a conhost window. The helper's
+        /// console is created like any console app's, so it respects the default terminal setting.
+        /// The helper waits for this process to exit, which keeps the console open until then.
+        /// </remarks>
+        private static bool TryAttachToConsoleHost()
+        {
+            if (IsRunningOnWine())
+            {
+                return false;
+            }
+
+            try
+            {
+                var hostPath = Path.GetFullPath(Path.Combine(
+                    Path.GetDirectoryName(typeof(WinConsole).Assembly.Location), "..", "..", "Libs", ConsoleHostFileName));
+                if (!File.Exists(hostPath))
+                {
+                    return false;
+                }
+
+                var startupInfo = new StartupInfo { cb = Marshal.SizeOf<StartupInfo>() };
+                var commandLine = new StringBuilder($"\"{hostPath}\" {GetCurrentProcessId()}");
+                if (!CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, false, CreateNewConsole,
+                        IntPtr.Zero, null, ref startupInfo, out var processInfo))
+                {
+                    return false;
+                }
+
+                try
+                {
+                    // The helper's console is set up (and handed off to the terminal) during its startup, so keep
+                    // trying until attaching succeeds or the helper exits.
+                    var stopwatch = Stopwatch.StartNew();
+                    while (stopwatch.ElapsedMilliseconds < ConsoleHostTimeoutMs)
+                    {
+                        if (AttachConsole((int)processInfo.dwProcessId))
+                        {
+                            return true;
+                        }
+
+                        if (WaitForSingleObject(processInfo.hProcess, 20) == WaitObject0)
+                        {
+                            return false;
+                        }
+                    }
+
+                    _ = TerminateProcess(processInfo.hProcess, 1);
+                    return false;
+                }
+                finally
+                {
+                    _ = CloseHandle(processInfo.hThread);
+                    _ = CloseHandle(processInfo.hProcess);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsRunningOnWine()
+        {
+            var ntdll = GetModuleHandle("ntdll.dll");
+            return ntdll != IntPtr.Zero && GetProcAddress(ntdll, "wine_get_version") != IntPtr.Zero;
         }
 
         private static void InitializeStreams()
@@ -46,7 +119,8 @@ namespace IPA.Logging
 
         private static void InitializeOutStream()
         {
-            var file = new SafeFileHandle(CreateFile("CONOUT$", GenericWrite, FileShareWrite,
+            // Get/SetConsoleMode and GetConsoleScreenBufferInfo need read access, writing needs write access.
+            var file = new SafeFileHandle(CreateFile("CONOUT$", GenericRead | GenericWrite, FileShareRead | FileShareWrite,
                 IntPtr.Zero, OpenExisting, FileAttributeNormal, IntPtr.Zero), true);
             if (!file.IsInvalid)
             {
@@ -56,11 +130,12 @@ namespace IPA.Logging
                 Console.SetOut(writer);
                 Console.SetError(writer);
 
-                var handle = GetStdHandle(-11); // get stdout handle (should be CONOUT$ at this point)
-                if (GetConsoleMode(handle, out var mode))
+                // Use our own CONOUT$ handle: AttachConsole keeps the process' existing std handles, so the
+                // stdout handle isn't necessarily the console.
+                if (GetConsoleMode(OutHandle, out var mode))
                 {
                     mode |= EnableVTProcessing;
-                    if (!SetConsoleMode(handle, mode))
+                    if (!SetConsoleMode(OutHandle, mode))
                     {
                         UseVTEscapes = false;
                         Console.Error.WriteLine("Could not enable VT100 escape code processing (maybe you're running an old Windows?): " +
@@ -157,14 +232,77 @@ namespace IPA.Logging
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
 
-        [DllImport("kernel32.dll")]
-        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
-        private static extern IntPtr GetStdHandle(int nStdHandle);
-
         [DllImport("kernel32.dll", EntryPoint = "WriteConsoleW", CharSet = CharSet.Unicode)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         private static extern bool WriteConsole(IntPtr hConsoleOutput, string lpBuffer, uint nNumberOfCharsToWrite,
             out uint lpNumberOfCharsWritten, IntPtr lpReserved);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern bool CreateProcess(string lpApplicationName, StringBuilder lpCommandLine,
+            IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags,
+            IntPtr lpEnvironment, string lpCurrentDirectory, ref StartupInfo lpStartupInfo, out ProcessInformation lpProcessInformation);
+
+        [DllImport("kernel32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        [DllImport("kernel32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+        [DllImport("kernel32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern uint GetCurrentProcessId();
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, BestFitMapping = false)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo
+        {
+            public int cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public uint dwX;
+            public uint dwY;
+            public uint dwXSize;
+            public uint dwYSize;
+            public uint dwXCountChars;
+            public uint dwYCountChars;
+            public uint dwFillAttribute;
+            public uint dwFlags;
+            public ushort wShowWindow;
+            public ushort cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+
+        private const string ConsoleHostFileName = "IPA.ConsoleHost.exe";
+        private const int ConsoleHostTimeoutMs = 5000;
+        private const uint CreateNewConsole = 0x00000010;
+        private const uint WaitObject0 = 0x00000000;
 
         private const uint EnableVTProcessing = 0x0004;
 

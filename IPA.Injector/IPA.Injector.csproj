@@ -42,6 +42,9 @@
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
 
     <ProjectReference Include="..\SemVer\SemVer.csproj" />
+
+    <!-- Copy the console host exe to the output (PostBuild moves it into Libs) without referencing it. -->
+    <ProjectReference Include="..\IPA.ConsoleHost\IPA.ConsoleHost.csproj" ReferenceOutputAssembly="false" OutputItemType="Content" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">

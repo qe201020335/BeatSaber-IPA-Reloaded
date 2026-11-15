@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="..\Common.props" />
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <RootNamespace>IPA.ConsoleHost</RootNamespace>
+    <AssemblyName>IPA.ConsoleHost</AssemblyName>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Prefer32Bit>false</Prefer32Bit>
+    <!-- Only the exe is copied next to the loader, so don't depend on an app.config. -->
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+    <GenerateSupportedRuntime>false</GenerateSupportedRuntime>
+  </PropertyGroup>
+
+  <Import Project="..\Common.targets" />
+
+</Project>
