@@ -2,6 +2,7 @@
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace IPA.Logging
@@ -45,10 +46,12 @@ namespace IPA.Logging
 
         private static void InitializeOutStream()
         {
-            var fs = CreateFileStream("CONOUT$", GenericWrite, FileShareWrite, FileAccess.Write, out outHandle);
-            if (fs != null)
+            var file = new SafeFileHandle(CreateFile("CONOUT$", GenericWrite, FileShareWrite,
+                IntPtr.Zero, OpenExisting, FileAttributeNormal, IntPtr.Zero), true);
+            if (!file.IsInvalid)
             {
-                var writer = new StreamWriter(fs) { AutoFlush = true };
+                outHandle = file;
+                var writer = new ConsoleWriter(OutHandle);
                 ConOut = writer;
                 Console.SetOut(writer);
                 Console.SetError(writer);
@@ -69,6 +72,40 @@ namespace IPA.Logging
                     UseVTEscapes = false;
                     Console.Error.WriteLine("Could not enable VT100 escape code processing (maybe you're running an old Windows?): " +
                         new Win32Exception(Marshal.GetLastWin32Error()).Message);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Writes UTF-16 text with <c>WriteConsoleW</c>, so the output doesn't depend on the console's code page.
+        /// </summary>
+        private sealed class ConsoleWriter : TextWriter
+        {
+            private readonly IntPtr handle;
+
+            public ConsoleWriter(IntPtr handle) => this.handle = handle;
+
+            public override Encoding Encoding => Encoding.Unicode;
+
+            public override void Write(char value) => Write(value.ToString());
+
+            public override void Write(char[] buffer, int index, int count) => Write(new string(buffer, index, count));
+
+            public override void Write(string value)
+            {
+                if (string.IsNullOrEmpty(value))
+                {
+                    return;
+                }
+
+                while (value.Length > 0)
+                {
+                    if (!WriteConsole(handle, value, (uint)value.Length, out var written, IntPtr.Zero) || written == 0)
+                    {
+                        return;
+                    }
+
+                    value = value.Substring((int)written);
                 }
             }
         }
@@ -123,6 +160,11 @@ namespace IPA.Logging
         [DllImport("kernel32.dll")]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll", EntryPoint = "WriteConsoleW", CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern bool WriteConsole(IntPtr hConsoleOutput, string lpBuffer, uint nNumberOfCharsToWrite,
+            out uint lpNumberOfCharsWritten, IntPtr lpReserved);
 
         private const uint EnableVTProcessing = 0x0004;
 
